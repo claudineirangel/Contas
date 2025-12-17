@@ -1,0 +1,1170 @@
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
+import {
+  LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer,
+  BarChart, Bar, CartesianGrid, Legend,
+  PieChart, Pie, Cell // NOVAS IMPORTAÇÕES
+} from 'recharts';
+
+// Firebase
+import { initializeApp } from 'firebase/app';
+import {
+  getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged
+} from 'firebase/auth';
+import {
+  getFirestore, doc, setDoc, deleteDoc, onSnapshot, collection, query, writeBatch
+} from 'firebase/firestore';
+
+/*
+  Controle de Contas - Único arquivo React
+  - Usa variáveis globais fornecidas pelo Canvas/ambiente: __firebase_config (JSON string) e __app_id
+  - Se não definidas, o app cai em modo offline com dados de exemplo
+  - Tema: cores animadas (azul, verde, roxo) com Tailwind
+  - Export CSV / Import CSV / CRUD / Gráficos
+*/
+
+// --------------------------
+// Fallbacks de configuração
+// --------------------------
+let appId = 'default-app-id';
+let firebaseConfig = {};
+
+try {
+  if (typeof __app_id !== 'undefined') appId = __app_id;
+  if (typeof __firebase_config !== 'undefined') firebaseConfig = JSON.parse(__firebase_config);
+} catch (err) {
+  console.warn('Falha ao ler variáveis globais do Firebase, iniciando em modo local.', err);
+}
+
+// --------------------------
+// Utilitários
+// --------------------------
+function addDays(d, days){ const x = new Date(d); x.setDate(x.getDate()+days); return x; }
+function addMonths(d, months){ const x = new Date(d); x.setMonth(x.getMonth()+months); return x; }
+
+function formatDate(d){
+  if (!d) return null;
+  const dt = new Date(d);
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth()+1).padStart(2,'0');
+  const day = String(dt.getDate()).padStart(2,'0');
+  return `${y}-${m}-${day}`;
+}
+
+function formatDisplayDate(dateString){
+  if (!dateString) return '';
+  if (typeof dateString === 'string' && dateString.includes('-')){
+    const parts = dateString.split('-');
+    return `${parts[2]}/${parts[1]}/${parts[0]}`;
+  }
+  const d = new Date(dateString);
+  if (isNaN(d.getTime())) return dateString;
+  return `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;
+}
+
+function formatCurrency(v){ if (v === null || v === undefined) return '0,00'; return Number(v).toLocaleString('pt-BR', {minimumFractionDigits:2, maximumFractionDigits:2}); }
+function cryptoRandom(){ return 'id_' + Math.random().toString(36).slice(2,9); }
+
+function sampleData(){
+  const today = new Date();
+  const creationDate = formatDate(today);
+  return [
+    { id: 't1', type:'receivable', title: 'Venda Projeto A', description: 'Parcela 1 de consultoria', amount: 4500, currency:'BRL', due_date: formatDate(addDays(today, 2)), paid_date: formatDate(addDays(today, -1)), status:'paid', category:'Serviços', account: 'Conta Corrente', creation_date: creationDate, paid_account: 'Conta Corrente', paid_bank: 'Itaú' },
+    { id: 't2', type:'payable', title: 'Aluguel Sala', description: 'Aluguel do escritório', amount: 1200, currency:'BRL', due_date: formatDate(addDays(today, -5)), paid_date: formatDate(addDays(today, -3)), status:'paid', category:'Aluguel', account: 'Caixa', creation_date: creationDate, paid_account: 'Conta Corrente', paid_bank: 'Banestes' },
+    { id: 't3', type:'payable', title: 'Conta Energia', description: 'Energia elétrica', amount: 320, currency:'BRL', due_date: formatDate(addDays(today, 7)), paid_date: null, status:'pending', category:'Contas de Consumo', account: 'Cartão de Crédito', creation_date: creationDate, paid_account: null, paid_bank: null },
+    { id: 't4', type:'receivable', title: 'Parcela Cliente B', description: '', amount: 900, currency:'BRL', due_date: formatDate(addDays(today, 10)), paid_date: formatDate(addDays(today, -10)), status:'paid', category:'Vendas', account: 'Poupança', creation_date: creationDate, paid_account: 'Poupança', paid_bank: 'Nubank' },
+    { id: 't5', type:'payable', title: 'Salário Funcionário', description: 'Salário João', amount: 2500, currency:'BRL', due_date: formatDate(addDays(today, 1)), paid_date: formatDate(addDays(today, -1)), status:'paid', category:'Recursos Humanos', account: 'Conta Corrente', creation_date: creationDate, paid_account: 'Conta Corrente', paid_bank: 'Itaú' },
+    { id: 't6', type:'receivable', title: 'Consultoria Marketing', description: '', amount: 3000, currency:'BRL', due_date: formatDate(addDays(today, 15)), paid_date: null, status:'pending', category:'Serviços', account: 'Poupança', creation_date: creationDate, paid_account: null, paid_bank: null },
+  ];
+}
+
+function buildCashflow(transactions, from, to){
+  const days = [];
+  const start = new Date(from);
+  const end = new Date(to);
+  if (isNaN(start.getTime()) || isNaN(end.getTime())) return [];
+  for (let d = new Date(start); d <= end; d.setDate(d.getDate()+1)) days.push(formatDate(new Date(d)));
+  const map = days.map(date => ({date, receivable:0, payable:0}));
+  for (const t of transactions){
+    const idx = map.findIndex(m => m.date === t.due_date);
+    if (idx >= 0){
+      if (t.type === 'receivable') map[idx].receivable += Number(t.amount);
+      else map[idx].payable += Number(t.amount);
+    }
+  }
+  return map;
+}
+
+function categoryDistribution(transactions){
+  const sums = {};
+  for (const t of transactions){
+    const k = t.category || 'Outros';
+    sums[k] = (sums[k] || 0) + Number(t.amount || 0);
+  }
+  // Retorna os dados ordenados por valor (amount)
+  return Object.entries(sums).map(([category, amount])=> ({category, amount})).sort((a,b)=> b.amount-a.amount);
+}
+
+function downloadFile(content, filename, mime){
+  const blob = new Blob([content], {type: mime});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = filename; a.click(); URL.revokeObjectURL(url);
+}
+
+function splitCSVLine(line){
+  const res = [];
+  let cur = '';
+  let inQuotes = false;
+  // NOVO: Delimitador de coluna mudou para ponto e vírgula
+  const DELIMITER = ';'; 
+  for (let i=0;i<line.length;i++){
+    const ch = line[i];
+    if (ch === '"'){
+      if (inQuotes && line[i+1] === '"') { cur += '"'; i++; continue; }
+      inQuotes = !inQuotes; cur += ch; continue;
+    }
+    // NOVO: Verifica o delimitador de coluna
+    if (ch === DELIMITER && !inQuotes) { res.push(cur.trim()); cur=''; continue; }
+    cur += ch;
+  }
+  if (cur) res.push(cur.trim());
+  return res;
+}
+
+function normalizeImported(obj){
+  const clean = (s) => String(s || '').replace(/^"|"$/g, '').trim();
+  const rawAmount = clean(obj.amount);
+  // Esta lógica é crucial e está correta para ler formato brasileiro:
+  // 1. Remove pontos (se usados como separador de milhar)
+  // 2. Troca vírgulas (usadas como separador decimal) por ponto (padrão JS)
+  const cleanAmount = rawAmount.replace(/\./g, '').replace(/,/g, '.');
+  const numericAmount = Math.abs(Number(cleanAmount) || 0);
+
+  let type = clean(obj.type) || (numericAmount && String(obj.amount).trim().startsWith('-') ? 'payable' : 'receivable') || 'receivable';
+  const combinedText = clean(obj.title) || clean(obj.description) || '';
+
+  let category = clean(obj.category) || 'Importado';
+  let title = clean(obj.title) || clean(obj.description) || 'Importada';
+
+  if (combinedText && numericAmount > 0){
+    const rawText = combinedText.replace(/r\$\s*/gi, '').replace(/\s+/g,' ').trim();
+    const amountStrDot = String(numericAmount.toFixed(2));
+    const amountStrInt = String(Math.floor(numericAmount));
+    const searchPattern = new RegExp(`(${amountStrDot}|${amountStrInt})`, 'i');
+    const match = rawText.match(searchPattern);
+    if (match){
+      const rawMatchIndex = match.index;
+      const rawMatchLength = match[0].length;
+      const textBeforeAmount = rawText.substring(0, rawMatchIndex).trim();
+      const textAfterAmount = rawText.substring(rawMatchIndex + rawMatchLength).trim();
+      if (textAfterAmount) title = textAfterAmount;
+      const prefixRegex = type === 'payable' ? /(a\s*pagar|a\s*apaga|payable)/i : /(a\s*receber|receivable)/i;
+      const prefixMatch = textBeforeAmount.match(prefixRegex);
+      if (prefixMatch){
+        let potentialCategory = textBeforeAmount.substring(prefixMatch.index + prefixMatch[0].length).trim();
+        if (potentialCategory) category = potentialCategory;
+      } else if (textBeforeAmount){
+        category = textBeforeAmount;
+      }
+    }
+  }
+
+  const out = {
+    id: clean(obj.id) || cryptoRandom(),
+    type,
+    title,
+    description: clean(obj.description) || '',
+    amount: numericAmount,
+    currency: clean(obj.currency) || 'BRL',
+    due_date: clean(obj.due_date) || formatDate(new Date()),
+    paid_date: clean(obj.paid_date) || null,
+    status: clean(obj.status) || (clean(obj.paid_date) ? 'paid' : 'pending'),
+    category,
+    account: clean(obj.account) || 'Não Especificada',
+    creation_date: clean(obj.creation_date) || formatDate(new Date()),
+    paid_account: clean(obj.paid_account) || null,
+    paid_bank: clean(obj.paid_bank) || null, // NOVO CAMPO: Banco/Fonte Pagadora
+  };
+
+  // Ajuste baseado em valor negativo textual
+  try{
+    if (obj.amount && String(obj.amount).replace(/\./g,'').replace(/,/g,'.').trim().startsWith('-')) out.type = 'payable';
+  }catch(e){}
+
+  return out;
+}
+
+// --------------------------
+// Constantes Globais de Opções
+// --------------------------
+const ACCOUNT_OPTIONS = ['Conta Corrente','Poupança','Caixa','Cartão de Crédito','Investimentos','Outros'];
+const CATEGORY_OPTIONS = ['Serviços','Aluguel','Contas de Consumo','Vendas','Recursos Humanos','Transporte','Alimentação','Lazer','Saúde','Educação','Impostos','Outros'];
+const COLORS = ['#8884d8', '#82ca9d', '#ffc658', '#ff8042', '#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#A0E7E5', '#B5EAD7', '#FFD8BE', '#B9FBC0']; // Cores para o Gráfico de Pizza
+const CUSTOM_BANK_OPTION = 'Outra Fonte (Pix, Dinheiro, etc.)'; // Opção customizada para o select
+const BANK_SOURCE_OPTIONS = [
+  'Banestes', 'Banco do Brasil', 'Itaú', 'Bradesco', 'Caixa Econômica Federal',
+  'Santander', 'Nubank', 'PicPay', CUSTOM_BANK_OPTION
+];
+
+
+// Função para renderizar o rótulo da fatia com valor e porcentagem (Gráfico de Categoria)
+const RADIAN = Math.PI / 180;
+const renderCustomizedLabel = ({ cx, cy, midAngle, innerRadius, outerRadius, percent, index, value, name }) => {
+  const radius = innerRadius + (outerRadius - innerRadius) * 0.5;
+  const x = cx + radius * Math.cos(-midAngle * RADIAN);
+  const y = cy + radius * Math.sin(-midAngle * RADIAN);
+
+  // Define a cor do texto para melhor contraste
+  const textColor = (COLORS[index % COLORS.length] === '#8884d8' || COLORS[index % COLORS.length] === '#0088FE' || COLORS[index % COLORS.length] === '#7c3aed') ? 'white' : 'black';
+
+  return (
+    <text 
+      x={x} y={y} 
+      fill={textColor} 
+      textAnchor={x > cx ? 'start' : 'end'} 
+      dominantBaseline="central" 
+      style={{fontSize: '10px', fontWeight: 'bold'}}
+    >
+      {`${formatCurrency(value)} (${(percent * 100).toFixed(0)}%)`}
+    </text>
+  );
+};
+
+// NOVO: Função para renderizar o rótulo da fatia com valor e porcentagem (Gráfico de Saldo - Fora do Donut)
+const renderBalanceLabel = ({ cx, cy, midAngle, outerRadius, percent, name, netBalance }) => {
+  const radius = outerRadius * 1.1; // Posiciona o rótulo um pouco para fora
+  const x = cx + radius * Math.cos(-midAngle * RADIAN);
+  const y = cy + radius * Math.sin(-midAngle * RADIAN);
+  
+  // Limita o nome para não estourar
+  const shortName = name.length > 15 ? name.substring(0, 12) + '...' : name; 
+
+  return (
+    <text x={x} y={y} fill="#4b5563" textAnchor={x > cx ? 'start' : 'end'} dominantBaseline="central" style={{fontSize: '10px'}}>
+      {`${shortName}: R$ ${formatCurrency(netBalance)} (${(percent * 100).toFixed(1)}%)`}
+    </text>
+  );
+};
+
+// Função para renderizar Tooltip para o Gráfico de Saldo
+const CustomBalanceTooltip = ({ active, payload, label }) => {
+  if (active && payload && payload.length) {
+    const data = payload[0].payload;
+
+    return (
+      <div className="bg-white p-3 border border-gray-300 rounded-lg shadow-lg text-xs">
+        <p className="font-semibold">{data.name}</p>
+        <p className={`mt-1 ${data.netBalance >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+          Saldo Líquido: R$ {formatCurrency(data.netBalance)}
+        </p>
+        <p className="text-gray-500">
+          Peso Absoluto: {(data.value / payload.reduce((sum, entry) => sum + entry.value, 0) * 100).toFixed(1)}%
+        </p>
+      </div>
+    );
+  }
+  return null;
+};
+
+
+// --------------------------
+// Formulário de Transação
+// --------------------------
+function TransactionForm({ initial, onCancel, onSave, showAlert }){
+  const [form, setForm] = useState(() => initial ? {...initial, amount: String(initial.amount).replace('.', ',')} : {
+    type: 'payable', title: '', description: '', amount: '', currency: 'BRL', due_date: formatDate(new Date()), status: 'pending', category: CATEGORY_OPTIONS[0], account: ACCOUNT_OPTIONS[0], creation_date: formatDate(new Date()), paid_account: null, paid_bank: null
+  });
+
+  const [isOtherAccount, setIsOtherAccount] = useState(() => initial && !ACCOUNT_OPTIONS.includes(initial.account));
+  const [isOtherCategory, setIsOtherCategory] = useState(() => initial && !CATEGORY_OPTIONS.includes(initial.category));
+
+  const formClass = 'p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-opacity-50 transition duration-150';
+
+  function change(k,v){ setForm(prev => ({...prev, [k]: v})); }
+
+  function handleAccountChange(e){
+    const value = e.target.value;
+    const isCustom = !ACCOUNT_OPTIONS.includes(value);
+    if (value === 'Outros' || isCustom){ setIsOtherAccount(true); change('account', isCustom ? value : ''); }
+    else { setIsOtherAccount(false); change('account', value); }
+  }
+
+  function handleCategoryChange(e){
+    const value = e.target.value;
+    const isCustom = !CATEGORY_OPTIONS.includes(value);
+    if (value === 'Outros' || isCustom){ setIsOtherCategory(true); change('category', isCustom ? value : ''); }
+    else { setIsOtherCategory(false); change('category', value); }
+  }
+
+  function submit(e){ e.preventDefault();
+    const cleanAmount = String(form.amount).replace(/\./g, '').replace(/,/g, '.');
+    if (!form.title || !cleanAmount || !form.due_date){ showAlert('Preencha nome, valor e data de vencimento'); return; }
+    if (!form.account || form.account === 'Outros'){ showAlert('Selecione ou digite um nome válido para a Conta.'); return; }
+    if (!form.category || form.category === 'Outros'){ showAlert('Selecione ou digite um nome válido para a Categoria.'); return; }
+    const payload = { ...form, amount: Number(cleanAmount) || 0, paid_date: form.status === 'paid' ? formatDate(new Date()) : null };
+    onSave(payload);
+  }
+
+  return (
+    <form onSubmit={submit} className="grid grid-cols-1 md:grid-cols-2 gap-4">
+      
+      {/* 1. Data da Compra (Criação) */}
+      <label className="flex flex-col">
+        <span className="text-sm font-medium text-gray-700 mb-1">Data da Compra</span>
+        <input type="date" name="creation_date" value={form.creation_date} onChange={e=>change('creation_date', e.target.value)} className={formClass} />
+      </label>
+
+      {/* 2. Tipo (Crédito/Débito) */}
+      <label className="flex flex-col">
+        <span className="text-sm font-medium text-gray-700 mb-1">Tipo</span>
+        <select name="type" value={form.type} onChange={e=>change('type', e.target.value)} className={formClass}>
+          <option value="payable">Débito (Pagar 🔴)</option>
+          <option value="receivable">Crédito (Receber 🟢)</option>
+        </select>
+      </label>
+      
+      {/* 3. Conta */}
+      <label className="flex flex-col">
+        <span className="text-sm font-medium text-gray-700 mb-1">Conta</span>
+        {!isOtherAccount ? (
+          <select value={form.account || 'Outros'} onChange={handleAccountChange} className={formClass}>
+            {ACCOUNT_OPTIONS.map(opt => <option key={opt} value={opt}>{opt}</option>)}
+            {!ACCOUNT_OPTIONS.includes(form.account) && form.account && <option value={form.account} hidden>{form.account} (Custom)</option>}
+          </select>
+        ) : (
+          <input value={form.account} onChange={e=>change('account', e.target.value)} className={formClass} placeholder="Nome da Conta Personalizada" />
+        )}
+      </label>
+
+      {/* 4. Nome da Transação / Descrição */}
+      <label className="flex flex-col">
+        <span className="text-sm font-medium text-gray-700 mb-1">Nome da Transação</span>
+        <input name="title" value={form.title} onChange={e=>change('title', e.target.value)} className={formClass} placeholder="Ex: Salário, Aluguel, Venda" />
+      </label>
+
+      <label className="flex flex-col md:col-span-2">
+        <span className="text-sm font-medium text-gray-700 mb-1">Descrição Detalhada</span>
+        <textarea value={form.description} onChange={e=>change('description', e.target.value)} className={formClass} rows="2"></textarea>
+      </label>
+      
+      {/* 5. Categoria */}
+      <label className="flex flex-col">
+        <span className="text-sm font-medium text-gray-700 mb-1">Categoria</span>
+        {!isOtherCategory ? (
+          <select value={form.category || 'Outros'} onChange={handleCategoryChange} className={formClass}>
+            {CATEGORY_OPTIONS.map(opt => <option key={opt} value={opt}>{opt}</option>)}
+            {!CATEGORY_OPTIONS.includes(form.category) && form.category && <option value={form.category} hidden>{form.category} (Custom)</option>}
+          </select>
+        ) : (
+          <input value={form.category} onChange={e=>change('category', e.target.value)} className={formClass} placeholder="Nome da Categoria Personalizada" />
+        )}
+      </label>
+
+      {/* 6. Valor */}
+      <label className="flex flex-col">
+        <span className="text-sm font-medium text-gray-700 mb-1">Valor (R$)</span>
+        <input name="amount" value={form.amount} onChange={e=>change('amount', e.target.value)} className={formClass} placeholder="1.500,00" />
+      </label>
+      
+      {/* 7. Vencimento */}
+      <label className="flex flex-col">
+        <span className="text-sm font-medium text-gray-700 mb-1">Vencimento</span>
+        <input type="date" value={form.due_date} onChange={e=>change('due_date', e.target.value)} className={formClass} />
+      </label>
+
+      {/* 8. Status */}
+      <label className="flex flex-col">
+        <span className="text-sm font-medium text-gray-700 mb-1">Status</span>
+        <select value={form.status} onChange={e=>change('status', e.target.value)} className={formClass}>
+          <option value="pending">Pendente</option>
+          <option value="paid">Pago</option>
+          <option value="overdue">Atrasado</option>
+          <option value="scheduled">Agendado</option>
+        </select>
+      </label>
+
+      <div className="md:col-span-2 flex gap-3 justify-end pt-3 border-t mt-4">
+        <button type="button" onClick={onCancel} className="px-4 py-2 bg-gray-100 text-gray-700 font-semibold rounded-lg hover:bg-gray-200">Cancelar</button>
+        <button type="submit" className="px-4 py-2 bg-gradient-to-r from-purple-500 via-indigo-500 to-blue-500 text-white font-semibold rounded-lg hover:from-purple-600 hover:via-indigo-600 hover:to-blue-600 shadow-md">Salvar Conta</button>
+      </div>
+    </form>
+  );
+}
+
+// --------------------------
+// Modal de Confirmação de Pagamento
+// --------------------------
+function PaymentAccountModal({ transaction, onConfirm, onCancel, showAlert }) {
+  // Use a conta da transação como padrão, ou a conta paga se já existir
+  const defaultAccount = transaction.paid_account || transaction.account || ACCOUNT_OPTIONS[0];
+  const [selectedAccount, setSelectedAccount] = useState(defaultAccount);
+  
+  // Define o valor padrão para o PaidBank/Fonte
+  const defaultBank = transaction.paid_bank && BANK_SOURCE_OPTIONS.includes(transaction.paid_bank) 
+    ? transaction.paid_bank 
+    : BANK_SOURCE_OPTIONS[0];
+
+  const [paidBank, setPaidBank] = useState(defaultBank);
+  const [customBankInput, setCustomBankInput] = useState(() => 
+    !BANK_SOURCE_OPTIONS.includes(transaction.paid_bank) && transaction.paid_bank 
+      ? transaction.paid_bank 
+      : ''
+  );
+  
+  const isCustomBankSelected = paidBank === CUSTOM_BANK_OPTION;
+
+
+  // Opções de conta, excluindo 'Outros' que deve ser tratada no formulário de edição
+  const accountOptions = ACCOUNT_OPTIONS.filter(o => o !== 'Outros');
+  if (!accountOptions.includes(selectedAccount)) {
+    accountOptions.push(selectedAccount);
+  }
+
+  const handleConfirm = () => {
+    if (!selectedAccount || selectedAccount === 'Outros') {
+      showAlert('Selecione uma conta válida.');
+      return;
+    }
+    
+    let finalBank = paidBank;
+    
+    if (isCustomBankSelected) {
+      finalBank = customBankInput.trim();
+      if (!finalBank) {
+        showAlert('Informe o nome da Fonte Pagadora/Recebedora customizada.');
+        return;
+      }
+    } else if (paidBank === CUSTOM_BANK_OPTION) {
+      showAlert('Selecione uma fonte específica ou digite o nome customizado.');
+      return;
+    }
+    
+    // Passa o nome do banco para a função de confirmação
+    onConfirm(transaction.id, selectedAccount, finalBank);
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+      <div className="bg-white rounded-xl shadow-2xl max-w-sm w-full p-6">
+        <h3 className="font-bold text-lg mb-4 text-gray-800">Confirmar {transaction.type === 'payable' ? 'Pagamento' : 'Recebimento'}</h3>
+        <p className="text-gray-600 mb-2">Conta: <span className="font-semibold">{transaction.title}</span></p>
+        <p className="text-gray-600 mb-4">Valor: <span className={`font-bold ${transaction.type === 'payable' ? 'text-red-500' : 'text-green-500'}`}>R$ {formatCurrency(transaction.amount)}</span></p>
+
+        <label className="flex flex-col mb-4">
+          <span className="text-sm font-medium text-gray-700 mb-1">Conta de Débito/Crédito:</span>
+          <select 
+            value={selectedAccount} 
+            onChange={e => setSelectedAccount(e.target.value)} 
+            className="p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-opacity-50 transition duration-150"
+          >
+            {accountOptions.map(opt => <option key={opt} value={opt}>{opt}</option>)}
+          </select>
+          <p className="text-xs text-gray-500 mt-1">Esta é a sua conta que será {transaction.type === 'payable' ? 'debitada' : 'creditada'}.</p>
+        </label>
+        
+        {/* NOVO CAMPO: Banco/Fonte Pagadora (SELECT) */}
+        <label className="flex flex-col mb-2">
+          <span className="text-sm font-medium text-gray-700 mb-1">Nome do Banco / Fonte Pagadora:</span>
+          <select
+              value={paidBank}
+              onChange={e => {
+                setPaidBank(e.target.value);
+                // Se o valor for um valor real já definido e não customizado, limpa o input customizado
+                if (e.target.value !== CUSTOM_BANK_OPTION) {
+                  setCustomBankInput(e.target.value);
+                }
+              }}
+              className="p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-opacity-50 transition duration-150"
+          >
+             {BANK_SOURCE_OPTIONS.map(opt => <option key={opt} value={opt}>{opt}</option>)}
+             {/* Garante que o valor customizado anterior apareça na lista se não for um dos padrões */}
+             {!BANK_SOURCE_OPTIONS.includes(transaction.paid_bank) && transaction.paid_bank && (
+                 <option key={transaction.paid_bank} value={transaction.paid_bank}>{transaction.paid_bank}</option>
+             )}
+          </select>
+        </label>
+        
+        {/* CAMPO CUSTOMIZADO (mostra apenas se a opção 'Outra Fonte' estiver selecionada) */}
+        {isCustomBankSelected && (
+            <label className="flex flex-col mb-6 mt-3">
+                <span className="text-sm font-medium text-gray-700 mb-1">Especifique a Fonte:</span>
+                <input
+                    type="text"
+                    value={customBankInput}
+                    onChange={e => setCustomBankInput(e.target.value)}
+                    placeholder="Ex: Cartão Visa, Dinheiro, Transferência João"
+                    className="p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-opacity-50 transition duration-150"
+                />
+            </label>
+        )}
+        
+        <p className="text-xs text-gray-500 mb-6 mt-1">Quem pagou (Débito) ou de onde veio (Crédito).</p>
+
+
+        <div className="flex justify-end gap-3">
+          <button onClick={onCancel} className="px-4 py-2 bg-gray-200 text-gray-700 rounded-lg">Cancelar</button>
+          <button onClick={handleConfirm} className="px-4 py-2 bg-green-600 text-white rounded-lg">Confirmar</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// --------------------------
+// Componente Principal
+// --------------------------
+export default function App(){
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+
+  const [transactions, setTransactions] = useState([]);
+  const [filterType, setFilterType] = useState('all');
+  const [filterStatus, setFilterStatus] = useState('all');
+  const [search, setSearch] = useState('');
+  const [selectedIds, setSelectedIds] = useState([]);
+  const [confirmState, setConfirmState] = useState({ visible: false, message: '', action: () => {} });
+  const [notificationMessage, setNotificationMessage] = useState(null);
+  const [paymentModalState, setPaymentModalState] = useState({ visible: false, transaction: null }); // Novo estado para o modal de pagamento
+
+  const defaultFrom = useMemo(() => formatDate(addMonths(new Date(), -1)), []);
+  const defaultTo = useMemo(() => formatDate(addMonths(new Date(), 2)), []);
+  const [fromDate, setFromDate] = useState(defaultFrom);
+  const [toDate, setToDate] = useState(defaultTo);
+
+  const [showForm, setShowForm] = useState(false);
+  const [editing, setEditing] = useState(null);
+  const [isLoading, setIsLoading] = useState(true);
+
+  const showAlert = useCallback((message) => { setNotificationMessage(message); setTimeout(()=>setNotificationMessage(null), 3500); }, []);
+  const showConfirmation = useCallback((message, action) => { setConfirmState({ visible:true, message, action }); }, []);
+  const handleConfirmYes = () => { confirmState.action(); setConfirmState({ visible:false, message:'', action: () => {} }); };
+  const handleConfirmNo = () => { setConfirmState({ visible:false, message:'', action: () => {} }); };
+
+  // Inicialização Firebase
+  useEffect(() => {
+    if (Object.keys(firebaseConfig).length === 0){
+      console.warn('Firebase não configurado. Usando dados locais.');
+      setTransactions(sampleData());
+      setIsAuthReady(true);
+      setIsLoading(false);
+      return;
+    }
+    try{
+      const app = initializeApp(firebaseConfig);
+      const _db = getFirestore(app);
+      const _auth = getAuth(app);
+      setDb(_db); setAuth(_auth);
+
+      const unsubscribe = onAuthStateChanged(_auth, async (user) => {
+        if (!user){
+          const customToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+          try{ if (customToken) await signInWithCustomToken(_auth, customToken); else await signInAnonymously(_auth); }catch(e){ console.error('Erro auth', e); }
+        }
+        setUserId(_auth.currentUser?.uid || cryptoRandom());
+        setIsAuthReady(true);
+      });
+
+      return () => unsubscribe();
+    }catch(e){ console.error('Erro Init Firebase', e); setIsAuthReady(true); setIsLoading(false); }
+  }, []);
+
+  // Listener Firestore
+  useEffect(() => {
+    if (!db || !userId) return;
+    const transactionColRef = collection(db, 'artifacts', appId, 'users', userId, 'transactions');
+    const q = query(transactionColRef);
+    setIsLoading(true);
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const loadedTransactions = snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
+      setTransactions(loadedTransactions);
+      setIsLoading(false);
+    }, (error) => { console.error('Erro fetching transactions:', error); setIsLoading(false); });
+    return () => unsubscribe();
+  }, [db, userId]);
+
+  const getTransactionDocRef = useCallback((id) => {
+    if (!db || !userId) return null;
+    return doc(db, 'artifacts', appId, 'users', userId, 'transactions', id);
+  }, [db, userId]);
+
+  async function handleSave(item){
+    if (Object.keys(firebaseConfig).length === 0){
+      // Offline: atualizar localmente
+      const isNew = !item.id;
+      const id = item.id || cryptoRandom();
+      const final = { ...item, id, amount: Number(item.amount) };
+      setTransactions(prev => {
+        if (isNew) return [final, ...prev];
+        return prev.map(p=> p.id === id ? final : p);
+      });
+      setShowForm(false); setEditing(null); showAlert(`Conta ${isNew ? 'criada' : 'atualizada'} (modo local)`);
+      return;
+    }
+
+    if (!db || !userId) return showAlert('Erro: Usuário não autenticado.');
+    const isNew = !item.id;
+    const transactionId = item.id || cryptoRandom();
+    const docRef = getTransactionDocRef(transactionId);
+    const finalItem = isNew && !item.creation_date ? { ...item, creation_date: formatDate(new Date()) } : item;
+    const { id, ...dataToSave } = { ...finalItem, id: transactionId };
+    try{
+      await setDoc(docRef, dataToSave);
+      setShowForm(false); setEditing(null); showAlert(`Conta ${isNew ? 'criada' : 'atualizada'} com sucesso!`);
+    }catch(e){ console.error('Erro ao salvar conta:', e); showAlert(`Erro ao salvar conta: ${e.message}`); }
+  }
+
+  // NOVA FUNÇÃO para marcar como pago após a confirmação da conta e banco
+  async function handleMarkPaidConfirm(id, paidAccount, paidBank){
+    setPaymentModalState({ visible: false, transaction: null }); // Fechar o modal
+    
+    if (Object.keys(firebaseConfig).length === 0){
+      setTransactions(prev => prev.map(t => t.id === id ? { ...t, status: 'paid', paid_date: formatDate(new Date()), paid_account: paidAccount, paid_bank: paidBank } : t)); 
+      showAlert('Conta marcada como paga (modo local).'); 
+      return;
+    }
+
+    if (!db || !userId) return showAlert('Erro: Usuário não autenticado.');
+    const docRef = getTransactionDocRef(id);
+    const paidDate = formatDate(new Date());
+
+    try{
+      // Salva a conta usada E o nome do banco/fonte pagadora
+      await setDoc(docRef, { status:'paid', paid_date: paidDate, paid_account: paidAccount, paid_bank: paidBank }, { merge: true }); 
+      showAlert('Conta marcada como paga!');
+    }catch(e){
+      console.error('Erro ao marcar como pago:', e); 
+      showAlert(`Erro ao marcar como pago: ${e.message}`);
+    }
+  }
+
+
+  function handleDelete(id){
+    showConfirmation('Tem certeza que deseja excluir esta conta? Esta ação é irreversível.', async () => {
+      if (Object.keys(firebaseConfig).length === 0){
+        setTransactions(prev => prev.filter(t => t.id !== id)); showAlert('Conta excluída (modo local).'); return;
+      }
+      if (!db || !userId) return showAlert('Erro: Usuário não autenticado.');
+      try{ await deleteDoc(getTransactionDocRef(id)); showAlert('Conta excluída.'); }catch(e){ console.error('Erro ao excluir conta:', e); showAlert(`Erro ao excluir conta: ${e.message}`); }
+    });
+  }
+
+  function handleDeleteSelected(){
+    if (selectedIds.length === 0) return showAlert('Selecione pelo menos uma conta para excluir.');
+    showConfirmation(`Tem certeza que deseja excluir ${selectedIds.length} conta(s) selecionada(s)? Esta ação é irreversível.`, async () => {
+      if (Object.keys(firebaseConfig).length === 0){ setTransactions(prev => prev.filter(t => !selectedIds.includes(t.id))); setSelectedIds([]); showAlert(`${selectedIds.length} conta(s) excluída(s) (modo local).`); return; }
+      if (!db || !userId) return showAlert('Erro: Usuário não autenticado.');
+      try{
+        const batch = writeBatch(db);
+        selectedIds.forEach(id => batch.delete(getTransactionDocRef(id)));
+        await batch.commit(); setSelectedIds([]); showAlert(`${selectedIds.length} conta(s) excluída(s) com sucesso.`);
+      }catch(e){ console.error('Erro ao excluir contas:', e); showAlert(`Erro ao excluir contas: ${e.message}`); }
+    });
+  }
+
+  function exportCSV(){
+    if (transactions.length === 0) return showAlert('Sem dados para exportar.');
+    
+    // NOVO: Delimitador de coluna padrão brasileiro
+    const DELIMITER = ';'; 
+    
+    const keys = Object.keys(transactions[0]).filter(k => k !== 'id');
+    const header = ['id', ...keys].join(DELIMITER);
+    
+    const rows = transactions.map(t => {
+      const rowData = keys.map(k => { 
+        let val = t[k] !== undefined && t[k] !== null ? t[k] : '';
+        
+        // NOVO: Formata o campo 'amount' para usar vírgula como separador decimal
+        if (k === 'amount') {
+          // Converte para string com 2 casas decimais e substitui o ponto decimal por vírgula
+          val = Number(val).toFixed(2).replace('.', ','); 
+        }
+        
+        // Envolve em aspas e escapa as aspas internas
+        return `"${String(val).replace(/"/g,'""')}"`; 
+      });
+      return [`"${t.id}"`, ...rowData].join(DELIMITER);
+    });
+    
+    const csv = [header, ...rows].join('\n');
+    
+    // NOVO: Adiciona charset=utf-8 para melhor compatibilidade com caracteres e softwares
+    downloadFile(csv, 'transactions.csv', 'text/csv;charset=utf-8');
+    showAlert('Exportação iniciada.');
+  }
+
+  function importCSVFile(e){
+    const file = e.target.files?.[0]; if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async () => {
+      const text = reader.result;
+      // Reutiliza splitCSVLine, que agora usa ponto e vírgula
+      const lines = text.split(/\r?\n/).filter(Boolean);
+      if (lines.length <= 1){ showAlert('O ficheiro CSV está vazio ou inválido.'); return; }
+      const keys = splitCSVLine(lines.shift()).map(k => k.replace(/^"|"$/g,'').trim());
+      const imported = lines.map(l => { const cols = splitCSVLine(l); const obj = {}; keys.forEach((k,i) => obj[k] = cols[i] ? cols[i].replace(/^"|"$/g,'') : null); return normalizeImported(obj); });
+      if (imported.length === 0) return showAlert('Nenhum dado válido para importar.');
+
+      if (Object.keys(firebaseConfig).length === 0){
+        setTransactions(prev => [...imported, ...prev]); showAlert(`${imported.length} contas importadas (modo local)`); return;
+      }
+
+      try{
+        const transactionColRef = collection(db, 'artifacts', appId, 'users', userId, 'transactions');
+        const batch = writeBatch(db);
+        imported.forEach(item => { const docRef = doc(transactionColRef, item.id); const { id, ...dataToSave } = item; batch.set(docRef, dataToSave); });
+        await batch.commit(); showAlert(`${imported.length} contas importadas com sucesso!`);
+      }catch(e){ console.error('Erro ao importar e salvar contas:', e); showAlert(`Erro ao importar e salvar contas: ${e.message}`); }
+    };
+    reader.readAsText(file, 'utf-8');
+  }
+
+  const toggleSelection = (id) => { setSelectedIds(prev => prev.includes(id) ? prev.filter(i => i !== id) : [...prev, id]); };
+  const toggleSelectAll = () => { if (selectedIds.length === visible.length && visible.length > 0) setSelectedIds([]); else setSelectedIds(visible.map(t => t.id)); };
+
+  const visible = useMemo(() => {
+    return transactions.filter(t => {
+      if (filterType !== 'all' && t.type !== filterType) return false;
+      if (filterStatus !== 'all' && t.status !== filterStatus) return false;
+      if (search && !(`${t.title} ${t.description} ${t.category} ${t.account}`.toLowerCase()).includes(search.toLowerCase())) return false;
+      if (fromDate && t.due_date < fromDate) return false;
+      if (toDate && t.due_date > toDate) return false;
+      return true;
+    }).sort((a,b) => a.due_date.localeCompare(b.due_date));
+  }, [transactions, filterType, filterStatus, search, fromDate, toDate]);
+
+  const summary = useMemo(() => {
+    const totals = { payable:0, receivable:0, overdue:0 };
+    const today = formatDate(new Date());
+    for (const t of transactions){
+      if (t.status !== 'paid'){
+        if (t.type === 'payable') totals.payable += Number(t.amount || 0);
+        else if (t.type === 'receivable') totals.receivable += Number(t.amount || 0);
+      }
+      if (t.status !== 'paid' && t.due_date < today) totals.overdue += Number(t.amount || 0);
+    }
+    const netBalance = totals.receivable - totals.payable;
+    return {...totals, netBalance};
+  }, [transactions]);
+
+  // CÁLCULO DE SALDO POR CONTA E RASTREAMENTO DE FONTES EXTERNAS
+  const accountBalances = useMemo(() => {
+    const balances = {};
+    const sourcesMap = {}; // Inicializado como objeto para armazenar saldos por fonte: { 'Conta Interna': { 'Fonte Externa': Saldo } }
+    const uniqueAccounts = new Set();
+    
+    // Coleta todas as contas existentes e pagas
+    transactions.forEach(t => {
+        if (t.account && t.account !== 'Outros') uniqueAccounts.add(t.account);
+        if (t.paid_account && t.paid_account !== 'Outros') uniqueAccounts.add(t.paid_account);
+    });
+
+    // Inicializa o saldo e o rastreamento de fontes
+    uniqueAccounts.forEach(acc => {
+      balances[acc] = 0;
+      sourcesMap[acc] = {}; // Inicializa o mapa de fontes para cada conta interna
+    });
+
+    // Calcula o saldo realizado (apenas transações pagas)
+    for (const t of transactions) {
+        if (t.status === 'paid' && t.paid_account) {
+            const amount = Number(t.amount || 0);
+            const paidAccount = t.paid_account;
+            // Usa 'Não Informado' se paid_bank for nulo/vazio
+            const paidBank = t.paid_bank && t.paid_bank.trim() ? t.paid_bank.trim() : 'Não Informado'; 
+            
+            // 1. Atualiza o saldo total da conta interna
+            if (t.type === 'payable') {
+                balances[paidAccount] = (balances[paidAccount] || 0) - amount;
+            } else if (t.type === 'receivable') {
+                balances[paidAccount] = (balances[paidAccount] || 0) + amount;
+            }
+
+            // 2. Atualiza o saldo líquido para a fonte/banco específica
+            if (!sourcesMap[paidAccount][paidBank]) {
+                sourcesMap[paidAccount][paidBank] = 0;
+            }
+            
+            if (t.type === 'payable') {
+                sourcesMap[paidAccount][paidBank] -= amount;
+            } else if (t.type === 'receivable') {
+                sourcesMap[paidAccount][paidBank] += amount;
+            }
+        }
+    }
+    
+    // 3. Converte para array, adiciona os saldos das fontes e ordena
+    return Object.entries(balances)
+        .map(([account, balance]) => ({ 
+            account, 
+            balance, 
+            sourceBalances: Object.entries(sourcesMap[account])
+                .map(([name, balance]) => ({ name, balance }))
+                .sort((a, b) => Math.abs(b.balance) - Math.abs(a.balance)) // Ordena pelo maior valor absoluto
+        }))
+        .sort((a, b) => b.balance - a.balance);
+  }, [transactions]);
+
+  // NOVO: Dados de Saldo da Conta com Maior Saldo Absoluto (para o Gráfico)
+  const topAccountSourceBalances = useMemo(() => {
+    if (accountBalances.length === 0) return { name: '', data: [] };
+    
+    // Encontrar a conta com maior saldo absoluto
+    const topAccount = accountBalances.reduce((prev, current) => 
+        Math.abs(current.balance) > Math.abs(prev.balance) ? current : prev
+    );
+
+    // Mapeia e filtra sources com valor absoluto > 0
+    const data = topAccount.sourceBalances.filter(s => Math.abs(s.balance) > 0)
+        .map(s => ({
+            name: s.name,
+            value: Math.abs(s.balance), // O Pie Chart usa valores absolutos para a fatia
+            netBalance: s.balance // Mantém o saldo líquido para tooltip
+        }));
+    
+    return { name: topAccount.account, data };
+
+  }, [accountBalances]);
+
+  const cashflowData = useMemo(() => buildCashflow(transactions, fromDate, toDate), [transactions, fromDate, toDate]);
+  // Filtra categories com valor > 0 para o gráfico
+  const categoryData = useMemo(() => categoryDistribution(transactions).filter(d => d.amount > 0), [transactions]);
+
+  const getNaturezaStyles = (type) => type === 'payable' ? 'text-red-600' : 'text-green-600';
+  
+  // FUNÇÃO para gerar o badge de status complexo
+  const getStatusBadge = useCallback((t) => {
+    let classes, icon, text, daysText = '';
+    const today = new Date(formatDate(new Date()));
+    const dueDate = new Date(t.due_date);
+    const diffTime = dueDate.getTime() - today.getTime();
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+    if (t.status === 'paid') {
+      classes = 'bg-green-100 text-green-800';
+      // Icone de dinheiro
+      icon = (<svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 inline mr-1" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 1v22"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>);
+      text = 'Pago';
+    } else if (t.status === 'overdue' || (t.status !== 'paid' && diffDays < 0)) {
+      classes = 'bg-red-100 text-red-800 border-red-300 border';
+      // Icone de relogio (Atrasado)
+      icon = (<svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 inline mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>);
+      text = 'Atrasado';
+      daysText = ` há ${Math.abs(diffDays)} dia(s)`;
+    } else if (t.status === 'scheduled') {
+      classes = 'bg-indigo-100 text-indigo-800';
+      // Icone de calendário (Agendado)
+      icon = (<svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 inline mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M8 7V3m8 4V3m-4 17a9 9 0 110-18 9 9 0 010 18z" /><path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6l4 2" /></svg>);
+      text = 'Agendado';
+      daysText = ` em ${diffDays} dia(s)`;
+    } else { // pending
+      classes = 'bg-yellow-100 text-yellow-800';
+      // Icone de exclamação (Pendente / A Vencer)
+      icon = (<svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 inline mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01M12 3a9 9 0 110 18 9 9 0 010-18z" /></svg>);
+      text = 'Pendente';
+      if (diffDays >= 0) {
+        daysText = ` em ${diffDays} dia(s)`;
+      }
+    }
+    
+    return (
+      <span className={`inline-flex items-center px-3 py-1 text-xs font-semibold rounded-full whitespace-nowrap ${classes}`} title={daysText.trim()}>
+        {icon}
+        {text}
+        {/* Exibe o nome do banco/fonte se a transação estiver paga */}
+        {t.status === 'paid' && t.paid_bank && <span className="ml-1 text-[10px] opacity-80 font-normal">{`(${t.paid_bank})`}</span>}
+        {diffDays > 0 && (t.status === 'pending' || t.status === 'scheduled') && <span className="ml-1 text-[10px] opacity-80">{`(${diffDays} dias)`}</span>}
+        {diffDays < 0 && t.status === 'overdue' && <span className="ml-1 text-[10px] opacity-80">{`(${-diffDays} dias)`}</span>}
+      </span>
+    );
+  }, []);
+
+  const clearAllFilters = () => { setFilterType('all'); setFilterStatus('all'); setSearch(''); setFromDate(defaultFrom); setToDate(defaultTo); setSelectedIds([]); };
+
+  if (!isAuthReady || isLoading){
+    return (
+      <div className="flex justify-center items-center min-h-screen bg-gradient-to-b from-purple-50 via-indigo-50 to-blue-50"> 
+        <div className="flex flex-col items-center p-6">
+          <svg className="animate-spin -ml-1 mr-3 h-12 w-12 text-indigo-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+          <p className="mt-4 text-gray-700 font-semibold">Carregando dados financeiros...</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-gray-50 min-h-screen p-4 sm:p-6 md:p-8 font-['Inter']">
+      {notificationMessage && (
+        <div className="fixed top-4 right-4 z-50 p-4 bg-gradient-to-r from-indigo-600 to-purple-600 text-white rounded-lg shadow-xl">{notificationMessage}</div>
+      )}
+
+      <div className="max-w-7xl mx-auto">
+        <header className="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-6 border-b pb-4">
+          <div>
+            <h1 className="text-3xl font-extrabold text-gray-800">Controle de Contas</h1>
+            <p className="text-sm text-gray-500 mt-1">Gestão de Contas a Pagar e a Receber em tempo real (Firestore). <span className="font-mono text-xs p-1 bg-gray-100 rounded">Usuário: {userId}</span></p>
+          </div>
+          <div className="flex flex-wrap gap-3 mt-4 sm:mt-0">
+            <button onClick={() => { setShowForm(true); setEditing(null); }} className="px-4 py-2 bg-gradient-to-r from-purple-500 via-indigo-500 to-blue-500 text-white font-semibold rounded-lg hover:from-purple-600 hover:via-indigo-600 hover:to-blue-600 shadow-md transition">Nova Conta</button>
+            <button onClick={exportCSV} className="px-4 py-2 bg-white border border-gray-200 text-gray-800 font-semibold rounded-lg hover:bg-gray-50 transition">Exportar CSV</button>
+            <label className="px-4 py-2 bg-white border border-gray-200 text-gray-800 font-semibold rounded-lg hover:bg-gray-50 transition cursor-pointer">
+              Importar CSV
+              <input type="file" accept=".csv" onChange={importCSVFile} className="hidden" />
+            </label>
+          </div>
+        </header>
+
+        <section className="grid grid-cols-2 md:grid-cols-4 gap-5 mb-8">
+          <div className="p-5 bg-gradient-to-r from-red-50 to-red-100 border border-red-200 text-red-800 rounded-xl shadow transition hover:shadow-xl">
+            <div className="text-sm font-medium">Total a Pagar Pendente</div>
+            <div className="text-2xl sm:text-3xl font-bold mt-1">R$ {formatCurrency(summary.payable)}</div>
+          </div>
+
+          <div className="p-5 bg-gradient-to-r from-green-50 to-green-100 border border-green-200 text-green-800 rounded-xl shadow transition hover:shadow-xl">
+            <div className="text-sm font-medium">Total a Receber Pendente</div>
+            <div className="text-2xl sm:text-3xl font-bold mt-1">R$ {formatCurrency(summary.receivable)}</div>
+          </div>
+
+          <div className={`p-5 rounded-xl shadow transition hover:shadow-xl ${summary.netBalance >= 0 ? 'bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-200 text-blue-800' : 'bg-gradient-to-r from-pink-50 to-pink-100 border border-pink-200 text-pink-800'}`}>
+            <div className="text-sm font-medium">Saldo Líquido Pendente</div>
+            <div className="text-2xl sm:text-3xl font-bold mt-1">R$ {formatCurrency(summary.netBalance)}</div>
+          </div>
+
+          <div className="p-5 bg-gradient-to-r from-yellow-50 to-yellow-100 border border-yellow-200 text-yellow-800 rounded-xl shadow transition hover:shadow-xl">
+            <div className="text-sm font-medium">Contas Atrasadas</div>
+            <div className="text-2xl sm:text-3xl font-bold mt-1">R$ {formatCurrency(summary.overdue)}</div>
+          </div>
+        </section>
+        
+        {/* NOVO PAINEL DE SALDO POR CONTA (AGORA COM GRÁFICO NA SEGUNDA COLUNA) */}
+        <section className="mb-8 p-5 bg-white rounded-xl shadow-lg">
+          <h2 className="text-xl font-semibold mb-4 text-gray-800">Saldos Realizados por Conta (Bancos/Fontes)</h2>
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            
+            {/* COLUNA 1: Lista de Contas Internas */}
+            <div className="space-y-4">
+              {accountBalances.length > 0 ? accountBalances.map(acc => (
+                <div key={acc.account} className={`p-4 rounded-xl shadow-md transition hover:shadow-lg ${acc.balance >= 0 ? 'bg-indigo-600 text-white' : 'bg-red-600 text-white'}`}>
+                  <div className="text-sm font-medium">{acc.account}</div>
+                  <div className="text-2xl font-bold mt-1">R$ {formatCurrency(acc.balance)}</div>
+                  
+                  {/* Exibe as fontes externas com seus saldos líquidos */}
+                  {acc.sourceBalances.length > 0 && (
+                      <div className="text-xs mt-2 pt-2 border-t border-white/30">
+                          <span className="font-semibold block mb-1">Fontes Líquidas:</span>
+                          <div className="space-y-0.5 max-h-[100px] overflow-y-auto pr-1">
+                              {acc.sourceBalances.map(source => (
+                                  <div key={source.name} className="flex justify-between items-center">
+                                      <span className="opacity-80 text-[10px] truncate max-w-[70%]">{source.name}</span>
+                                      <span className={`font-medium text-[10px] ${source.balance >= 0 ? 'text-green-300' : 'text-red-300'}`}>
+                                          R$ {formatCurrency(source.balance)}
+                                      </span>
+                                  </div>
+                              ))}
+                          </div>
+                      </div>
+                  )}
+                </div>
+              )) : <p className="text-gray-500 p-4">Nenhum saldo realizado para calcular. Marque contas como pagas para ver o saldo.</p>}
+            </div>
+
+            {/* COLUNA 2: Gráfico de Pizza da Conta Mais Ativa */}
+            <div className="p-4 bg-gray-50 rounded-xl shadow-inner">
+                <h3 className="font-bold text-lg mb-4 text-gray-800">
+                    Distribuição de Saldo (Conta Mais Ativa: {topAccountSourceBalances.name || 'N/A'})
+                </h3>
+                {topAccountSourceBalances.data.length > 0 ? (
+                    // Adiciona position:relative para posicionar o texto central
+                    <div style={{height: 300, position: 'relative'}}> 
+                        {/* Texto Centralizado (Valor Total) */}
+                        {(() => {
+                            const totalAbsoluteValue = topAccountSourceBalances.data.reduce((sum, entry) => sum + entry.value, 0);
+                            return (
+                                <div style={{
+                                    position: 'absolute',
+                                    top: '50%',
+                                    left: '50%',
+                                    transform: 'translate(-50%, -50%)',
+                                    textAlign: 'center',
+                                    pointerEvents: 'none', // Permite interagir com o gráfico por baixo
+                                    width: '100px'
+                                }}>
+                                    <div className="text-sm font-semibold text-gray-700">Total Mov.</div>
+                                    <div className="text-xl font-bold text-indigo-700">R$ {formatCurrency(totalAbsoluteValue)}</div>
+                                </div>
+                            );
+                        })()}
+                        
+                        <ResponsiveContainer width="100%" height="100%">
+                            <PieChart margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
+                                <Pie
+                                    data={topAccountSourceBalances.data}
+                                    dataKey="value"
+                                    nameKey="name"
+                                    cx="50%"
+                                    cy="50%"
+                                    outerRadius={100}
+                                    innerRadius={70} // Cria o donut
+                                    fill="#7c3aed"
+                                    labelLine={true}
+                                    label={renderBalanceLabel} // Rótulo externo com % e R$
+                                    isAnimationActive={true}
+                                >
+                                    {topAccountSourceBalances.data.map((entry, index) => (
+                                        <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
+                                    ))}
+                                </Pie>
+                                <Tooltip content={<CustomBalanceTooltip />} />
+                                <Legend 
+                                    layout="vertical" 
+                                    verticalAlign="middle" 
+                                    align="right" 
+                                    wrapperStyle={{ fontSize: '10px' }} 
+                                />
+                            </PieChart>
+                        </ResponsiveContainer>
+                    </div>
+                ) : (
+                    <div className="h-full flex items-center justify-center text-gray-500">
+                        Nenhuma movimentação paga suficiente para gerar o gráfico de fontes.
+                    </div>
+                )}
+            </div>
+            
+          </div>
+        </section>
+
+        <section className="mb-8 p-6 bg-white rounded-xl shadow-lg">
+          <h2 className="text-xl font-semibold mb-4 text-gray-800">Filtros e Transações ({transactions.length} total)</h2>
+
+          <div className="flex flex-wrap gap-4 items-center mb-6">
+            <select value={filterType} onChange={e => setFilterType(e.target.value)} className="p-2 border rounded-lg">
+              <option value="all">Todos os tipos</option>
+              <option value="payable">Pagar</option>
+              <option value="receivable">Receber</option>
+            </select>
+            <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)} className="p-2 border rounded-lg">
+              <option value="all">Todos os status</option>
+              <option value="pending">Pendente</option>
+              <option value="paid">Pago</option>
+              <option value="overdue">Atrasado</option>
+              <option value="scheduled">Agendado</option>
+            </select>
+            <input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)} className="p-2 border rounded-lg" title="Data Inicial do Vencimento" />
+            <input type="date" value={toDate} onChange={e => setToDate(e.target.value)} className="p-2 border rounded-lg" title="Data Final do Vencimento" />
+            <input placeholder="Pesquisar (Título, Conta, Categoria...)" value={search} onChange={e => setSearch(e.target.value)} className="p-2 border rounded-lg flex-1 min-w-[200px]" />
+            <button onClick={clearAllFilters} className="px-4 py-2 bg-white border border-gray-200 text-gray-800 font-semibold rounded-lg">Limpar Filtros</button>
+            {selectedIds.length > 0 && (
+              <button onClick={handleDeleteSelected} className="px-4 py-2 bg-red-600 text-white font-semibold rounded-lg hover:bg-red-700">Excluir {selectedIds.length} Selecionado(s)</button>
+            )}
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm text-gray-600 border-collapse">
+              <thead className="text-left text-gray-700 bg-gray-100 uppercase text-xs"><tr><th className="p-3 font-semibold rounded-tl-lg w-10"><input type="checkbox" checked={selectedIds.length === visible.length && visible.length > 0} onChange={toggleSelectAll} className="h-4 w-4" /></th><th className="p-3 font-semibold">Data</th><th className="p-3 font-semibold">Tipo</th><th className="p-3 font-semibold">Conta</th><th className="p-3 font-semibold">Descrição</th><th className="p-3 font-semibold">Categoria</th><th className="p-3 font-semibold text-right">Valor (R$)</th><th className="p-3 font-semibold">Vencimento</th><th className="p-3 font-semibold">Status</th><th className="p-3 font-semibold rounded-tr-lg">Ações</th></tr></thead>
+              <tbody className="divide-y divide-gray-100">{visible.map((t) => (<tr key={t.id} className={`hover:bg-blue-50 transition ${selectedIds.includes(t.id) ? 'bg-blue-100' : ''}`} onClick={() => { if (window.getSelection().toString().length === 0) { setEditing(t); setShowForm(true); } }} style={{cursor:'pointer'}}><td className="p-3"><input type="checkbox" checked={selectedIds.includes(t.id)} onChange={(e)=>{ e.stopPropagation(); toggleSelection(t.id); }} className="h-4 w-4" /></td><td className="p-3">{formatDisplayDate(t.creation_date)}</td><td className={`p-3 font-medium text-xs whitespace-nowrap ${getNaturezaStyles(t.type)}`}>{t.type === 'payable' ? 'DÉBITO' : 'CRÉDITO'}</td><td className="p-3 font-medium text-xs whitespace-nowrap">{t.account}</td><td className="p-3 text-xs text-gray-500 truncate max-w-[100px] cursor-help" title={t.title + (t.description ? ' - ' + t.description : '')}>{t.title}</td><td className="p-3">{t.category}</td><td className="p-3 font-semibold text-right">R$ {formatCurrency(t.amount)}</td><td className="p-3">{formatDisplayDate(t.due_date)}</td><td className="p-3">{getStatusBadge(t)}</td><td className="p-3 whitespace-nowrap"><div className="flex gap-2">{t.status !== 'paid' && (<button onClick={(e) => { e.stopPropagation(); setPaymentModalState({ visible: true, transaction: t }); }} className="p-1 text-white bg-green-500 rounded-lg hover:bg-green-600 transition shadow-sm" title={`Marcar como ${t.type === 'payable' ? 'pago' : 'recebido'}`}><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg></button>)}<button onClick={(e) => { e.stopPropagation(); handleDelete(t.id); }} className="p-1 text-white bg-red-500 rounded-lg hover:bg-red-600 transition shadow-sm" title="Excluir"><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg></button></div></td></tr>))}
+                {visible.length === 0 && (<tr><td colSpan="10" className="p-4 text-center text-gray-500">Nenhuma transação encontrada com os filtros atuais.</td></tr>)}</tbody>
+            </table>
+          </div>
+        </section>
+
+        <section className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
+          <div className="p-5 bg-white rounded-xl shadow-lg">
+            <h3 className="font-bold text-lg mb-4 text-gray-800">Fluxo de Caixa por Data</h3>
+            <div className="flex gap-2 text-sm mb-4 items-center flex-wrap">
+              <label className="text-gray-600 text-sm">De:</label>
+              <input type="date" value={fromDate} onChange={e=>setFromDate(e.target.value)} className="p-1 border rounded-lg" />
+              <label className="text-gray-600 text-sm">Até:</label>
+              <input type="date" value={toDate} onChange={e=>setToDate(e.target.value)} className="p-1 border rounded-lg" />
+            </div>
+            <div style={{height:280}}>
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={cashflowData} margin={{ top:5, right:20, left:0, bottom:5 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" vertical={false} />
+                  <XAxis dataKey="date" tickFormatter={(tick) => formatDisplayDate(tick)} style={{fontSize:'10px'}} />
+                  <YAxis tickFormatter={(tick) => formatCurrency(tick)} style={{fontSize:'10px'}} />
+                  <Tooltip formatter={(value, name)=>[`R$ ${formatCurrency(value)}`, name]} labelFormatter={(label)=>`Data: ${formatDisplayDate(label)}`} />
+                  <Legend wrapperStyle={{fontSize:'12px'}} />
+                  <Line type="monotone" dataKey="receivable" name="A Receber" stroke="#10b981" strokeWidth={2} dot={false} />
+                  <Line type="monotone" dataKey="payable" name="A Pagar" stroke="#ef4444" strokeWidth={2} dot={false} />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+
+          <div className="p-5 bg-white rounded-xl shadow-lg">
+            <h3 className="font-bold text-lg mb-4 text-gray-800">Distribuição por Categoria</h3>
+            <div style={{height:280}}>
+              <ResponsiveContainer width="100%" height="100%">
+                {/* Gráfico de Pizza */}
+                <PieChart margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
+                  <Pie
+                    data={categoryData}
+                    dataKey="amount"
+                    nameKey="category"
+                    cx="50%"
+                    cy="50%"
+                    outerRadius={100}
+                    fill="#8884d8"
+                    labelLine={false}
+                    label={renderCustomizedLabel} // Rótulo customizado (valor e percentual)
+                    isAnimationActive={true}
+                  >
+                    {categoryData.map((entry, index) => (
+                      <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
+                    ))}
+                  </Pie>
+                  <Tooltip 
+                    formatter={(value, name) => [`R$ ${formatCurrency(value)}`, name]} 
+                    labelFormatter={(label) => `Categoria: ${label}`}
+                  />
+                  <Legend 
+                    layout="horizontal" 
+                    verticalAlign="bottom" 
+                    align="center" 
+                    wrapperStyle={{ fontSize: '12px' }} 
+                  />
+                </PieChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+        </section>
+
+        {showForm && (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+            <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full p-6 transform transition-all duration-300 scale-100">
+              <h2 className="font-extrabold text-xl mb-4 text-gray-800">{editing ? 'Editar Conta' : 'Nova Conta'}</h2>
+              <TransactionForm initial={editing} onCancel={() => { setShowForm(false); setEditing(null); }} onSave={handleSave} showAlert={showAlert} />
+            </div>
+          </div>
+        )}
+        
+        {/* Modal de Confirmação de Pagamento */}
+        {paymentModalState.visible && (
+          <PaymentAccountModal
+            transaction={paymentModalState.transaction}
+            onConfirm={handleMarkPaidConfirm}
+            onCancel={() => setPaymentModalState({ visible: false, transaction: null })}
+            showAlert={showAlert}
+          />
+        )}
+
+        {confirmState.visible && (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+            <div className="bg-white rounded-xl shadow-2xl max-w-sm w-full p-6">
+              <h3 className="font-bold text-lg mb-4 text-gray-800">Confirmação</h3>
+              <p className="text-gray-600 mb-6">{confirmState.message}</p>
+              <div className="flex justify-end gap-3">
+                <button onClick={handleConfirmNo} className="px-4 py-2 bg-gray-200 text-gray-700 rounded-lg">Cancelar</button>
+                <button onClick={handleConfirmYes} className="px-4 py-2 bg-red-600 text-white rounded-lg">Confirmar</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+      </div>
+    </div>
+  );
+}
